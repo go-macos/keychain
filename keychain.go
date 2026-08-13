@@ -19,6 +19,7 @@ package keychain
 import (
 	"errors"
 	"fmt"
+	"time"
 )
 
 // OSStatus values from the Security framework that the package branches on.
@@ -44,7 +45,137 @@ var (
 	// (the Keychain is macOS-only). Exported symbols exist everywhere so
 	// consumers cross-compile.
 	ErrUnsupported = errors.New("keychain: unsupported on this platform (darwin only)")
+
+	// ErrAuthContextClosed is returned when an [AuthContext] is used after
+	// [AuthContext.Close], or when a nil context is passed to [WithAuthContext].
+	ErrAuthContextClosed = errors.New("keychain: AuthContext is closed")
+
+	// LocalAuthentication (LAError) sentinels. A biometric operation
+	// ([Authenticate], [CanEvaluate] or a Touch-ID-gated [Get]) reports one of
+	// these via a wrapping [*LAError], comparable with [errors.Is]. Codes with
+	// no dedicated sentinel surface as a bare [*LAError] carrying the raw code.
+	//
+	// ErrUserCanceled maps LAErrorUserCancel / SystemCancel / AppCancel — the
+	// prompt was dismissed rather than failing.
+	ErrUserCanceled = errors.New("keychain: authentication canceled")
+	// ErrAuthenticationFailed maps LAErrorAuthenticationFailed — the presented
+	// biometric did not match.
+	ErrAuthenticationFailed = errors.New("keychain: authentication failed")
+	// ErrBiometryNotAvailable maps LAErrorBiometryNotAvailable — no biometric
+	// hardware, or the app is denied access to it.
+	ErrBiometryNotAvailable = errors.New("keychain: biometry not available")
+	// ErrBiometryNotEnrolled maps LAErrorBiometryNotEnrolled — hardware exists
+	// but no fingerprint/face is enrolled.
+	ErrBiometryNotEnrolled = errors.New("keychain: no biometric enrolled")
+	// ErrBiometryLockout maps LAErrorBiometryLockout — too many failed attempts;
+	// a passcode unlock is required to re-enable biometry.
+	ErrBiometryLockout = errors.New("keychain: biometry locked out")
+	// ErrPasscodeNotSet maps LAErrorPasscodeNotSet — a device passcode is
+	// required for the policy but none is set.
+	ErrPasscodeNotSet = errors.New("keychain: device passcode not set")
 )
+
+// BiometryType identifies the biometric hardware LocalAuthentication reports
+// through -[LAContext biometryType] (valid only after a canEvaluatePolicy:
+// probe, which [CanEvaluate] performs).
+type BiometryType int
+
+const (
+	// BiometryNone means no biometric sensor is available (or none was
+	// detected).
+	BiometryNone BiometryType = iota
+	// BiometryTouchID is a Touch ID fingerprint sensor.
+	BiometryTouchID
+	// BiometryFaceID is a Face ID camera.
+	BiometryFaceID
+	// BiometryOpticID is an Optic ID iris sensor.
+	BiometryOpticID
+)
+
+// String renders the biometry type for logs and the demo.
+func (b BiometryType) String() string {
+	switch b {
+	case BiometryTouchID:
+		return "TouchID"
+	case BiometryFaceID:
+		return "FaceID"
+	case BiometryOpticID:
+		return "OpticID"
+	default:
+		return "None"
+	}
+}
+
+// LAError wraps an NSError code from the LocalAuthentication framework. It
+// unwraps to a sentinel (e.g. [ErrUserCanceled]) for the codes that have one,
+// so both errors.Is(err, ErrUserCanceled) and inspection of the raw Code work.
+type LAError struct {
+	// Code is the raw LAError code (an NSInteger; the documented values are
+	// negative, e.g. -2 for user cancel).
+	Code int64
+	// sentinel is the mapped sentinel, or nil for an unclassified code.
+	sentinel error
+}
+
+// Error implements the error interface.
+func (e *LAError) Error() string {
+	if e.sentinel != nil {
+		return fmt.Sprintf("%v (LAError %d)", e.sentinel, e.Code)
+	}
+	return fmt.Sprintf("keychain: LocalAuthentication error %d", e.Code)
+}
+
+// Unwrap exposes the mapped sentinel for [errors.Is].
+func (e *LAError) Unwrap() error { return e.sentinel }
+
+// Documented LAError codes (LAError.h). Only the ones with a dedicated sentinel
+// are named here; any other code surfaces as a bare [*LAError].
+const (
+	laErrAuthenticationFailed int64 = -1
+	laErrUserCancel           int64 = -2
+	laErrSystemCancel         int64 = -4
+	laErrPasscodeNotSet       int64 = -5
+	laErrBiometryNotAvailable int64 = -6
+	laErrBiometryNotEnrolled  int64 = -7
+	laErrBiometryLockout      int64 = -8
+	laErrAppCancel            int64 = -9
+)
+
+// mapLAError classifies a raw LAError code into an [*LAError], attaching a
+// sentinel for the codes callers commonly branch on.
+func mapLAError(code int64) error {
+	var s error
+	switch code {
+	case laErrAuthenticationFailed:
+		s = ErrAuthenticationFailed
+	case laErrUserCancel, laErrSystemCancel, laErrAppCancel:
+		s = ErrUserCanceled
+	case laErrPasscodeNotSet:
+		s = ErrPasscodeNotSet
+	case laErrBiometryNotAvailable:
+		s = ErrBiometryNotAvailable
+	case laErrBiometryNotEnrolled:
+		s = ErrBiometryNotEnrolled
+	case laErrBiometryLockout:
+		s = ErrBiometryLockout
+	}
+	return &LAError{Code: code, sentinel: s}
+}
+
+// biometryTypeFromRaw maps an -[LAContext biometryType] value to a
+// [BiometryType].
+func biometryTypeFromRaw(raw int64) BiometryType {
+	switch raw {
+	case 1:
+		return BiometryTouchID
+	case 2:
+		return BiometryFaceID
+	case 3:
+		return BiometryOpticID
+	default:
+		return BiometryNone
+	}
+}
 
 // Error wraps a non-success, non-not-found OSStatus from the Security
 // framework, tagged with the operation that produced it.
@@ -118,11 +249,25 @@ var (
 	// OSStatus.
 	backendSet func(service, account string, secret []byte, cfg config) int32
 	// backendGet reads the secret for (service, account), returning the bytes
-	// and an OSStatus.
-	backendGet func(service, account string) ([]byte, int32)
+	// and an OSStatus. authCtx is the LAContext handle from an [AuthContext]
+	// (0 for none); when set it is passed to SecItemCopyMatching as
+	// kSecUseAuthenticationContext so a Touch-ID-gated read reuses that context.
+	backendGet func(service, account string, authCtx uintptr) ([]byte, int32)
 	// backendDelete removes the item for (service, account) and returns an
 	// OSStatus.
 	backendDelete func(service, account string) int32
+
+	// backendNewAuthContext allocates an LAContext with the given Touch ID
+	// reuse duration and returns its handle.
+	backendNewAuthContext func(reuse time.Duration) (uintptr, error)
+	// backendCloseAuthContext releases the LAContext behind handle.
+	backendCloseAuthContext func(handle uintptr)
+	// backendCanEvaluate probes canEvaluatePolicy: and reports the biometry
+	// type (and any reason it cannot evaluate).
+	backendCanEvaluate func() (BiometryType, error)
+	// backendAuthenticate runs evaluatePolicy: on the LAContext behind handle
+	// (0 = a throwaway context), blocking until the reply block fires.
+	backendAuthenticate func(handle uintptr, reason string) error
 )
 
 // Set stores secret under the generic-password item identified by
@@ -146,15 +291,47 @@ func Set(service, account string, secret []byte, opts ...Option) error {
 	return nil
 }
 
+// getConfig is the resolved set of [GetOption] values for a [Get].
+type getConfig struct {
+	authCtx   uintptr
+	ctxClosed bool
+}
+
+// GetOption customises a [Get]. Options are applied left to right.
+type GetOption func(*getConfig)
+
+// WithAuthContext makes [Get] read through ac's [AuthContext], so a
+// Touch-ID-gated item ([WithAccessControl] + a biometric flag) prompts once and
+// then, within the context's reuse window, is read again without re-prompting.
+// Passing a nil or already-closed context makes the [Get] fail with
+// [ErrAuthContextClosed].
+func WithAuthContext(ac *AuthContext) GetOption {
+	return func(g *getConfig) {
+		if ac == nil || ac.closed {
+			g.ctxClosed = true
+			return
+		}
+		g.authCtx = ac.handle
+	}
+}
+
 // Get returns the secret stored under (service, account). It returns
 // [ErrNotFound] when no such item exists and [ErrUnsupported] off darwin.
-// Reading an item created with [WithAccessControl] and [UserPresence]
-// triggers the system biometric prompt.
-func Get(service, account string) ([]byte, error) {
+// Reading an item created with [WithAccessControl] and [UserPresence] (or a
+// biometric flag) triggers the system biometric prompt; pass [WithAuthContext]
+// to reuse a single unlock across several reads.
+func Get(service, account string, opts ...GetOption) ([]byte, error) {
 	if backendLoadErr != nil {
 		return nil, backendLoadErr
 	}
-	b, st := backendGet(service, account)
+	var g getConfig
+	for _, o := range opts {
+		o(&g)
+	}
+	if g.ctxClosed {
+		return nil, ErrAuthContextClosed
+	}
+	b, st := backendGet(service, account, g.authCtx)
 	switch st {
 	case errSecSuccess:
 		return b, nil
@@ -175,4 +352,82 @@ func Delete(service, account string) error {
 		return &Error{Op: "delete", Status: st}
 	}
 	return nil
+}
+
+// AuthContext wraps a LocalAuthentication LAContext so a single Touch ID unlock
+// can be reused across several reads. Create one with [NewAuthContext], pass it
+// to [Get] via [WithAuthContext], and release it with [Close]. It is not safe
+// for concurrent use across goroutines. The zero value is not usable.
+type AuthContext struct {
+	// handle is the retained LAContext object (an ObjC id as a uintptr on
+	// darwin); 0 once closed or off darwin.
+	handle uintptr
+	closed bool
+}
+
+// NewAuthContext allocates an LAContext whose successful biometric evaluation
+// is reusable for the given duration: after one unlock, a Touch-ID-gated [Get]
+// made through this context (see [WithAuthContext]) within reuse does not
+// re-prompt. A zero or negative reuse prompts on every read. The caller must
+// [Close] the returned context. Off darwin it returns [ErrUnsupported].
+func NewAuthContext(reuse time.Duration) (*AuthContext, error) {
+	if backendLoadErr != nil {
+		return nil, backendLoadErr
+	}
+	h, err := backendNewAuthContext(reuse)
+	if err != nil {
+		return nil, err
+	}
+	return &AuthContext{handle: h}, nil
+}
+
+// Close releases the underlying LAContext. It is idempotent and safe on a nil
+// receiver. After Close the context must not be used again.
+func (a *AuthContext) Close() {
+	if a == nil || a.closed {
+		return
+	}
+	a.closed = true
+	backendCloseAuthContext(a.handle)
+	a.handle = 0
+}
+
+// Authenticate presents the biometric prompt for this context (reusing its
+// unlock window) with reason as the localized explanation, blocking until the
+// user responds. It returns nil on success or a wrapping [*LAError] otherwise
+// (compare with [errors.Is] against [ErrUserCanceled], [ErrAuthenticationFailed],
+// …). It fails with [ErrAuthContextClosed] on a closed or nil context.
+func (a *AuthContext) Authenticate(reason string) error {
+	if backendLoadErr != nil {
+		return backendLoadErr
+	}
+	if a == nil || a.closed {
+		return ErrAuthContextClosed
+	}
+	return backendAuthenticate(a.handle, reason)
+}
+
+// CanEvaluate reports whether device-owner biometric authentication is
+// currently possible and which [BiometryType] the hardware offers. When
+// evaluation is not possible it returns the detected type together with a
+// wrapping [*LAError] explaining why (e.g. [ErrBiometryNotEnrolled]). Off
+// darwin it returns [ErrUnsupported].
+func CanEvaluate() (BiometryType, error) {
+	if backendLoadErr != nil {
+		return BiometryNone, backendLoadErr
+	}
+	return backendCanEvaluate()
+}
+
+// Authenticate presents the system biometric prompt with reason as the
+// localized explanation and blocks until the user responds, using a throwaway
+// LAContext (no reuse). It returns nil on success or a wrapping [*LAError]
+// otherwise. For reuse across reads, prefer [NewAuthContext] +
+// [AuthContext.Authenticate] / [WithAuthContext]. Off darwin it returns
+// [ErrUnsupported].
+func Authenticate(reason string) error {
+	if backendLoadErr != nil {
+		return backendLoadErr
+	}
+	return backendAuthenticate(0, reason)
 }
