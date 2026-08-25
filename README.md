@@ -2,7 +2,6 @@
 
 [![CI](https://github.com/go-macos/keychain/actions/workflows/ci.yml/badge.svg)](https://github.com/go-macos/keychain/actions/workflows/ci.yml)
 [![Go Reference](https://pkg.go.dev/badge/github.com/go-macos/keychain.svg)](https://pkg.go.dev/github.com/go-macos/keychain)
-[![Go Report Card](https://goreportcard.com/badge/github.com/go-macos/keychain)](https://goreportcard.com/report/github.com/go-macos/keychain)
 [![License: BSD-3-Clause](https://img.shields.io/badge/License-BSD--3--Clause-blue.svg)](LICENSE)
 
 Pure-Go (`CGO_ENABLED=0`) store for macOS Keychain **generic-password** items.
