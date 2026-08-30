@@ -18,7 +18,7 @@ jobs:
       - uses: actions/checkout@v4
       - uses: actions/setup-go@v5
         with:
-          go-version: '1.26.4'
+          go-version: '1.27.0'
       - name: Vet
         # -unsafeptr is disabled: reading Security.framework's kSec* data
         # symbols (CFStringRef) via purego needs an unavoidable uintptr->Pointer
@@ -41,7 +41,7 @@ jobs:
       - uses: actions/checkout@v4
       - uses: actions/setup-go@v5
         with:
-          go-version: '1.26.4'
+          go-version: '1.27.0'
       - name: Vet
         # -unsafeptr is disabled: reading Security.framework's kSec* data
         # symbols (CFStringRef) via purego needs an unavoidable uintptr->Pointer
@@ -60,7 +60,7 @@ jobs:
       - uses: actions/checkout@v4
       - uses: actions/setup-go@v5
         with:
-          go-version: '1.26.4'
+          go-version: '1.27.0'
       - name: Build stub
         run: go build ./...
         env:
@@ -91,7 +91,7 @@ jobs:
       - uses: actions/checkout@v4
       - uses: actions/setup-go@v5
         with:
-          go-version: '1.26.4'
+          go-version: '1.27.0'
       - name: Cross-compile (CGO=0)
         run: go build ./...
         env:
