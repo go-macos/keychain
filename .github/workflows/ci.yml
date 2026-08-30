@@ -15,7 +15,7 @@ jobs:
     name: darwin (real Keychain round-trips, CGO=0)
     runs-on: macos-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: actions/setup-go@v5
         with:
           go-version: '1.27.0'
@@ -38,7 +38,7 @@ jobs:
     name: linux (stub build + OS-independent tests)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: actions/setup-go@v5
         with:
           go-version: '1.27.0'
@@ -57,7 +57,7 @@ jobs:
     name: windows (stub build + tests)
     runs-on: windows-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: actions/setup-go@v5
         with:
           go-version: '1.27.0'
@@ -88,7 +88,7 @@ jobs:
           - { goos: linux, goarch: loong64 }
           - { goos: linux, goarch: s390x }
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: actions/setup-go@v5
         with:
           go-version: '1.27.0'
