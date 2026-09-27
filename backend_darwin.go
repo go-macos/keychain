@@ -3,10 +3,13 @@
 package keychain
 
 import (
+	"errors"
 	"fmt"
+	"time"
 	"unsafe"
 
 	"github.com/ebitengine/purego"
+	pobjc "github.com/ebitengine/purego/objc"
 	"github.com/go-macos/objc"
 )
 
@@ -46,6 +49,7 @@ var (
 	kSecMatchLimitOne                            uintptr
 	kSecAttrAccessControl                        uintptr
 	kSecAttrAccessibleWhenUnlockedThisDeviceOnly uintptr
+	kSecUseAuthenticationContext                 uintptr
 	kCFBooleanTrue                               uintptr
 
 	// Addresses of the dictionary callback structs (passed by pointer).
@@ -53,11 +57,150 @@ var (
 	kCFTypeDictionaryValueCallBacks uintptr
 )
 
+// LocalAuthentication framework path (go-macos/objc has no constant for it) and
+// the LAPolicy values used by the Touch ID paths.
+const (
+	localAuthentication = "/System/Library/Frameworks/LocalAuthentication.framework/LocalAuthentication"
+
+	// laPolicyDeviceOwnerAuthenticationWithBiometrics requires a biometric
+	// (Touch ID / Face ID); it does not fall back to the passcode.
+	laPolicyDeviceOwnerAuthenticationWithBiometrics = 1
+)
+
+// laLoadErr records why the LocalAuthentication surface is unavailable, kept
+// separate from backendLoadErr so a missing LA framework does not disable the
+// plain Set/Get/Delete keychain paths. It is nil once LAContext resolves.
+var laLoadErr error
+
 func init() {
 	load()
+	loadLA()
 	backendSet = realSet
 	backendGet = realGet
 	backendDelete = realDelete
+	backendNewAuthContext = realNewAuthContext
+	backendCloseAuthContext = realCloseAuthContext
+	backendCanEvaluate = realCanEvaluate
+	backendAuthenticate = realAuthenticate
+}
+
+// loadLA readies the LocalAuthentication surface: it inherits any core load
+// failure, then dlopens Foundation (for NSString) and LocalAuthentication and
+// confirms the LAContext class resolved. Failures land in laLoadErr only, so
+// the keychain paths keep working without biometrics.
+func loadLA() {
+	if backendLoadErr != nil {
+		laLoadErr = backendLoadErr
+		return
+	}
+	if err := objc.Load(objc.Foundation, localAuthentication); err != nil {
+		laLoadErr = fmt.Errorf("keychain: load LocalAuthentication: %w", err)
+		return
+	}
+	if objc.GetClass("LAContext") == 0 {
+		laLoadErr = errors.New("keychain: LAContext class unavailable")
+	}
+}
+
+// newLAContext allocates and inits an LAContext (caller releases). It returns 0
+// only on an unexpected allocation failure.
+func newLAContext() objc.ID {
+	return objc.ID(objc.GetClass("LAContext")).Send(objc.Sel("alloc")).Send(objc.Sel("init"))
+}
+
+// laErrorFromNSError reads the -[NSError code] and classifies it via
+// mapLAError. A nil NSError (an unexpected "failed but no error" reply) is
+// reported as a generic authentication failure.
+func laErrorFromNSError(nsErr objc.ID) error {
+	if nsErr == 0 {
+		return ErrAuthenticationFailed
+	}
+	return mapLAError(objc.Send[int64](nsErr, objc.Sel("code")))
+}
+
+// realNewAuthContext is the darwin backendNewAuthContext: it allocates a
+// retained LAContext and, when reuse > 0, sets its Touch ID reuse duration so a
+// later evaluation within the window does not re-prompt.
+func realNewAuthContext(reuse time.Duration) (uintptr, error) {
+	if laLoadErr != nil {
+		return 0, laLoadErr
+	}
+	ctx := newLAContext()
+	if ctx == 0 {
+		return 0, errors.New("keychain: LAContext init failed")
+	}
+	ctx = ctx.Send(objc.Sel("retain"))
+	if reuse > 0 {
+		ctx.Send(objc.Sel("setTouchIDAuthenticationAllowableReuseDuration:"), reuse.Seconds())
+	}
+	return uintptr(ctx), nil
+}
+
+// realCloseAuthContext is the darwin backendCloseAuthContext.
+func realCloseAuthContext(handle uintptr) {
+	if handle == 0 {
+		return
+	}
+	objc.ID(handle).Send(objc.Sel("release"))
+}
+
+// realCanEvaluate is the darwin backendCanEvaluate. biometryType is only
+// meaningful after canEvaluatePolicy:, so it probes first, then reads the type.
+func realCanEvaluate() (BiometryType, error) {
+	if laLoadErr != nil {
+		return BiometryNone, laLoadErr
+	}
+	ctx := newLAContext()
+	if ctx == 0 {
+		return BiometryNone, errors.New("keychain: LAContext init failed")
+	}
+	defer ctx.Send(objc.Sel("release"))
+
+	var nsErr objc.ID
+	ok := objc.Send[bool](ctx, objc.Sel("canEvaluatePolicy:error:"),
+		laPolicyDeviceOwnerAuthenticationWithBiometrics, &nsErr)
+	bt := biometryTypeFromRaw(objc.Send[int64](ctx, objc.Sel("biometryType")))
+	if !ok {
+		return bt, laErrorFromNSError(nsErr)
+	}
+	return bt, nil
+}
+
+// realAuthenticate is the darwin backendAuthenticate. It drives
+// evaluatePolicy:localizedReason:reply:, bridging the ObjC completion block
+// (built with purego's NewBlock) to a Go channel so the call is synchronous.
+// handle == 0 uses a throwaway context.
+func realAuthenticate(handle uintptr, reason string) error {
+	if laLoadErr != nil {
+		return laLoadErr
+	}
+	if reason == "" {
+		reason = "authenticate"
+	}
+	ctx := objc.ID(handle)
+	if handle == 0 {
+		ctx = newLAContext()
+		if ctx == 0 {
+			return errors.New("keychain: LAContext init failed")
+		}
+		defer ctx.Send(objc.Sel("release"))
+	}
+
+	res := make(chan error, 1)
+	// reply is void(^)(BOOL success, NSError *error); purego reads the BOOL as
+	// the low byte, so the bool parameter is the correct ABI here.
+	block := pobjc.NewBlock(func(_ pobjc.Block, success bool, nsErr objc.ID) {
+		if success {
+			res <- nil
+			return
+		}
+		res <- laErrorFromNSError(nsErr)
+	})
+	defer block.Release()
+
+	ctx.Send(objc.Sel("evaluatePolicy:localizedReason:reply:"),
+		laPolicyDeviceOwnerAuthenticationWithBiometrics, objc.NSString(reason), block)
+	return <-res
 }
 
 // load resolves every CoreFoundation + Security symbol the backend needs,
@@ -137,6 +280,7 @@ func load() {
 	kSecMatchLimitOne = ref(sec, "kSecMatchLimitOne")
 	kSecAttrAccessControl = ref(sec, "kSecAttrAccessControl")
 	kSecAttrAccessibleWhenUnlockedThisDeviceOnly = ref(sec, "kSecAttrAccessibleWhenUnlockedThisDeviceOnly")
+	kSecUseAuthenticationContext = ref(sec, "kSecUseAuthenticationContext")
 }
 
 // cfStr makes a CFString from a Go string (caller releases).
@@ -204,8 +348,10 @@ func realSet(service, account string, secret []byte, cfg config) int32 {
 
 // realGet is the darwin backendGet. It copies the stored bytes into a
 // Go-owned slice so nothing points at CoreFoundation-owned memory after the
-// CFData is released.
-func realGet(service, account string) ([]byte, int32) {
+// CFData is released. When authCtx is non-zero it is threaded to
+// SecItemCopyMatching as kSecUseAuthenticationContext, so a Touch-ID-gated read
+// reuses that LAContext's unlock window instead of prompting afresh.
+func realGet(service, account string, authCtx uintptr) ([]byte, int32) {
 	svc, acc := cfStr(service), cfStr(account)
 	defer cfRelease(svc)
 	defer cfRelease(acc)
@@ -214,6 +360,9 @@ func realGet(service, account string) ([]byte, int32) {
 	defer cfRelease(q)
 	cfDictSetValue(q, kSecReturnData, kCFBooleanTrue)
 	cfDictSetValue(q, kSecMatchLimit, kSecMatchLimitOne)
+	if authCtx != 0 {
+		cfDictSetValue(q, kSecUseAuthenticationContext, authCtx)
+	}
 
 	var result uintptr
 	if st := secItemCopyMatching(q, &result); st != errSecSuccess {
