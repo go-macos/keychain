@@ -20,11 +20,9 @@ jobs:
         with:
           go-version: '1.27.2'
       - name: Vet
-        # -unsafeptr is disabled: reading Security.framework's kSec* data
-        # symbols (CFStringRef) via purego needs an unavoidable uintptr->Pointer
-        # deref the analyzer over-flags. All other unsafe uses go through
-        # unsafe.Slice.
-        run: CGO_ENABLED=0 go vet -unsafeptr=false ./...
+        # Every analyzer, unsafeptr included: the kSec* data symbols are read
+        # without a uintptr->Pointer conversion (symbolValue).
+        run: CGO_ENABLED=0 go vet ./...
       - name: gofmt
         run: test -z "$(gofmt -l .)" || { gofmt -l .; exit 1; }
       - name: Test (CGO=0, on-device store/get/update/delete round-trips)
@@ -43,11 +41,7 @@ jobs:
         with:
           go-version: '1.27.2'
       - name: Vet
-        # -unsafeptr is disabled: reading Security.framework's kSec* data
-        # symbols (CFStringRef) via purego needs an unavoidable uintptr->Pointer
-        # deref the analyzer over-flags. All other unsafe uses go through
-        # unsafe.Slice.
-        run: CGO_ENABLED=0 go vet -unsafeptr=false ./...
+        run: CGO_ENABLED=0 go vet ./...
       - name: Test (stub + pure logic)
         run: CGO_ENABLED=0 go test -count=1 ./...
       - name: Race (pure logic)
