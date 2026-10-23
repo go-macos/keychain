@@ -6,8 +6,13 @@ import (
 	"bytes"
 	"errors"
 	"fmt"
+	"runtime"
+	"sync"
 	"testing"
 	"time"
+
+	"github.com/ebitengine/purego"
+	"github.com/go-macos/objc"
 )
 
 // The (service, account) pairs used by the on-device tests. They are unique to
@@ -69,6 +74,58 @@ func TestPlumbing(t *testing.T) {
 		if v == 0 {
 			t.Errorf("constant %s is nil", name)
 		}
+	}
+}
+
+// TestSymbolValue reads a data symbol's value the way load does and checks it
+// is what the symbol holds: kCFBooleanTrue is a CFBoolean (CFGetTypeID equals
+// CFBooleanGetTypeID) and is true. Read from many goroutines at once, so that
+// the race detector and checkptr (both on under -race, which CI runs on
+// darwin) see the path.
+func TestSymbolValue(t *testing.T) {
+	cf, err := purego.Dlopen(objc.CoreFoundation, purego.RTLD_LAZY|purego.RTLD_GLOBAL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	register := func(fn any, name string) {
+		p, err := purego.Dlsym(cf, name)
+		if err != nil {
+			t.Fatal(err)
+		}
+		purego.RegisterFunc(fn, p)
+	}
+	var getTypeID func(cf uintptr) uint
+	var booleanType func() uint
+	var booleanGetValue func(b uintptr) bool
+	register(&getTypeID, "CFGetTypeID")
+	register(&booleanType, "CFBooleanGetTypeID")
+	register(&booleanGetValue, "CFBooleanGetValue")
+	addr, err := purego.Dlsym(cf, "kCFBooleanTrue")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	var wg sync.WaitGroup
+	got := make([]uintptr, 16)
+	for i := range got {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			got[i] = symbolValue(addr)
+		}()
+	}
+	wg.Wait()
+	for i, v := range got {
+		if v != kCFBooleanTrue {
+			t.Fatalf("read %d = %#x, load read %#x", i, v, kCFBooleanTrue)
+		}
+	}
+	if getTypeID(kCFBooleanTrue) != booleanType() || !booleanGetValue(kCFBooleanTrue) {
+		t.Fatalf("kCFBooleanTrue (%#x) is not the CFBoolean true", kCFBooleanTrue)
+	}
+	runtime.GC() // nothing of ours points at it: the value is unchanged after a collection
+	if symbolValue(addr) != kCFBooleanTrue {
+		t.Fatal("the symbol's value changed across a GC")
 	}
 }
 

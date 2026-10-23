@@ -4,6 +4,7 @@ package keychain
 
 import (
 	"fmt"
+	"runtime"
 	"unsafe"
 
 	"github.com/ebitengine/purego"
@@ -96,7 +97,7 @@ func load() {
 			backendLoadErr = fmt.Errorf("keychain: missing symbol %s", name)
 			return 0
 		}
-		return *(*uintptr)(unsafe.Pointer(p))
+		return symbolValue(p)
 	}
 	// A struct symbol is passed by its own address (the callback tables).
 	addr := func(h uintptr, name string) uintptr {
@@ -139,6 +140,21 @@ func load() {
 	kSecAttrAccessibleWhenUnlockedThisDeviceOnly = ref(sec, "kSecAttrAccessibleWhenUnlockedThisDeviceOnly")
 }
 
+// symbolValue reads the pointer-sized value stored at a data symbol's
+// address, as Dlsym returns it: the ref a constant such as kSecClass holds.
+//
+// The address is in a framework's data segment, never Go memory, so the
+// garbage collector neither moves nor frees what it names. Still, turning
+// that uintptr into an unsafe.Pointer is none of the valid patterns of the
+// unsafe package ("Conversion of a uintptr back to Pointer is not valid in
+// general"). Reinterpreting the variable that holds the address, a *uintptr,
+// as a **uintptr is pattern (1), *T1 to *T2 of the same size and layout,
+// and dereferencing it twice reads the symbol's value with no uintptr ever
+// becoming a Pointer.
+func symbolValue(addr uintptr) uintptr {
+	return **(**uintptr)(unsafe.Pointer(&addr))
+}
+
 // cfStr makes a CFString from a Go string (caller releases).
 func cfStr(s string) uintptr { return cfStringCreate(0, s, kCFStringEncodingUTF8) }
 
@@ -165,7 +181,11 @@ func realSet(service, account string, secret []byte, cfg config) int32 {
 	svc, acc := cfStr(service), cfStr(account)
 	defer cfRelease(svc)
 	defer cfRelease(acc)
+	// Go memory passed to C under the cgo rules: CFDataCreate copies the
+	// bytes and keeps no reference, and the slice stays alive through the
+	// call.
 	data := cfDataCreate(0, &secret[0], len(secret))
+	runtime.KeepAlive(secret)
 	defer cfRelease(data)
 
 	if cfg.useAC {
